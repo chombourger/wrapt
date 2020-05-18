@@ -1,0 +1,440 @@
+#!/usr/bin/env python3
+
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import yaml
+
+class AptBootstrap:
+    def __init__(self, directory):
+        self._apt_conf = None
+        self._apt_dir = os.path.join(directory, "etc", "apt")
+        self._directory = directory
+        self._dpkg_dir = os.path.join(directory, "var", "lib", "dpkg")
+        self._etc_dir = os.path.join(directory, "etc", "apt")
+        self._stage2_dir = os.path.join(directory, "stage2")
+
+    def _make_config(self, architecture=None):
+        self._apt_conf = tempfile.NamedTemporaryFile(mode="w", delete=False)
+        with open(self._apt_conf.name, "w") as conf:
+            if architecture is not None:
+                conf.write('APT::Architecture "%s";\n' % architecture)
+            conf.write('Dir "%s";\n' % os.path.abspath(self._directory))
+            conf.write('Dir::Etc::Trusted "/etc/apt/trusted.gpg";\n')
+            conf.write('Dir::Etc::TrustedParts "/etc/apt/trusted.gpg.d";\n')
+            conf.write('Acquire::Check-Valid-Until "false";\n')
+
+    def _make_sources_list(self, repositories):
+        with open(os.path.join(self._apt_dir, "sources.list"), "w") as conf:
+            for r in repositories:
+                conf.write("%s %s %s %s\n" % (
+                    r["type"],
+                    r["url"],
+                    r["suite"],
+                    " ".join(r["components"])))
+
+    def _make_empty_file(self, path):
+        with open(path, "w") as f:
+            f.truncate()
+
+    def _make_dpkg_files(self):
+        self._make_empty_file(os.path.join(self._dpkg_dir, "available"))
+        self._make_empty_file(os.path.join(self._dpkg_dir, "status"))
+
+    def config(self):
+        return self._apt_conf.name
+
+    def download(self, lockedPackages, repositories, architecture=None):
+        self._make_config(architecture)
+
+        self.setup(repositories)
+        os.makedirs(self._etc_dir, exist_ok=True)
+        os.makedirs(self._stage2_dir, exist_ok=True)
+        debs = os.path.join(self._stage2_dir, "debs")
+        os.makedirs(debs, exist_ok=True)
+
+        self._make_sources_list(repositories)
+        self._make_dpkg_files()
+
+        # Update package database
+        subprocess.check_call(["apt-get", "-c", self.config(), "update"])
+
+        # Download locked packages
+        apt = AptGet(self)
+        apt.download(debs, lockedPackages)
+        os.unlink(self.config())
+
+        # Create setup script for our stage 2
+        setup_script = os.path.join(self._stage2_dir, "setup.sh")
+        scr = open(setup_script, "w")
+        scr.write("#!/bin/sh\n\n");
+        scr.write("set -e\n\n");
+        scr.write("export DEBIAN_FRONTEND=noninteractive\n");
+        scr.write("export DEBCONF_NONINTERACTIVE_SEEN=true\n");
+        scr.write("export LANG=C\n");
+        scr.write("export LANGUAGE=C\n");
+        scr.write("export LC_ALL=C\n\n");
+        scr.write("deb_dir='/stage2/debs'\n")
+        scr.write("dpkg_opts='--unpack --force-confnew --force-overwrite --force-depends'\n")
+        scr.write("dpkg ${dpkg_opts} -R /stage2/debs\n\n")
+
+        # Environment for apt/dpkg tools
+        env = AptEnv.make(self.config())
+
+        # Extract downloaded packages (leaving them unconfigured for now)
+        save_env = os.path.join(self._stage2_dir, "fakeroot.env")
+        save_env_f = open(save_env, "w")
+        for p in lockedPackages.values():
+            deb = os.path.join(debs, p.file())
+            #scr.write("dpkg ${dpkg_opts} ${deb_dir}/%s\n" % p.file())
+            save_file = tempfile.NamedTemporaryFile(mode="w", delete=False)
+            cmd = [ "fakeroot", "-s", save_file.name, "--", "dpkg", "-X", deb, self._directory ]
+            subprocess.check_call(cmd)
+            with open(save_file.name, "r") as f:
+                save_data = f.read()
+                save_env_f.write(save_data)
+            os.unlink(save_file.name)
+
+        scr.write("\ndpkg --configure -a\n")
+        save_env_f.close()
+        scr.close()
+
+    def setup(self, repositories):
+        # create top-level directories
+        os.makedirs(self._apt_dir, exist_ok=True)
+        os.makedirs(self._dpkg_dir, exist_ok=True)
+        os.makedirs(os.path.join(self._dpkg_dir, "info"), exist_ok=True)
+        os.makedirs(os.path.join(self._dpkg_dir, "updates"), exist_ok=True)
+
+        # create apt sub-directories
+        os.makedirs(os.path.join(self._apt_dir, "apt.conf.d"), exist_ok=True)
+        os.makedirs(os.path.join(self._apt_dir, "preferences.d"), exist_ok=True)
+        os.makedirs(os.path.join(self._apt_dir, "sources.list.d"), exist_ok=True)
+
+        self._make_sources_list(repositories)
+        self._make_dpkg_files()
+
+    def lookup(self, packages, repositories, architecture=None, excludeImportantPackages=True):
+        self.setup(repositories)
+        self._make_config(architecture)
+
+        # Update package database
+        subprocess.check_call(["apt-get", "-c", self.config(), "update"])
+
+        cache = AptCache(self)
+        apt = AptGet(self)
+
+        all_names = cache.packages()
+        policies = cache.policies(all_names)
+        candidates = { name: AptVersion(policies[name]["candidateVersion"]) for name in policies }
+        all_info = cache.info(candidates)
+
+        # Initialize list of "wanted" packages with any packages marked "essential" or "required"
+        wanted = {}
+        for p in all_names:
+            policy = policies[p]
+            entries = all_info[p]
+            info = None
+            for e in entries.values():
+                if e["packageVersion"] == policy["candidateVersion"]:
+                    info = e
+
+            if info["essential"] is not None and info["essential"] == "yes":
+                sys.stderr.write("adding essential package '%s'\n" % p)
+                wanted[p] = AptVersion(version=None)
+                continue
+
+            elif info["priority"] == "required":
+                sys.stderr.write("adding required package '%s'\n" % p)
+                wanted[p] = AptVersion(version=None)
+
+            elif info["priority"] == "important":
+                if excludeImportantPackages == False:
+                    sys.stderr.write("adding important package '%s'\n" % p)
+                    wanted[p] = AptVersion(version=None)
+
+        # Add packages listed in the user-provided list to the "wanted" list
+        for p in packages:
+            if packages[p] == "latest":
+                wanted[p] = AptVersion(version=None)
+            else:
+                wanted[p] = AptVersion(packages[p])
+
+        versions = apt.resolve(wanted)
+        results = {}
+        for p in versions:
+            required = False
+            if p not in packages and p in wanted:
+                required = True
+            version = versions[p]
+            info = all_info[p][version.tuple()]
+            results[p] = LockedPackage(p, version, info, required)
+
+        os.unlink(self.config())
+        return results
+
+class AptCache:
+    def __init__(self, bootstrap):
+        self._bootstrap = bootstrap
+
+    def packages(self):
+        env = AptEnv.make(self._bootstrap.config())
+        proc = subprocess.Popen(["apt-cache", "pkgnames"], env=env, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+        out, err = proc.communicate()
+        out = out.decode("utf-8")
+        return out.splitlines()
+
+    def policies(self, packages):
+        env = AptEnv.make(self._bootstrap.config())
+        cmd = [ "apt-cache", "policy" ]
+        for p in packages:
+            cmd.append(p)
+        proc = subprocess.Popen(cmd, env=env, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+        out, err = proc.communicate()
+        matches = out.decode("utf-8").splitlines()
+        name = None
+        value = None
+        results = {}
+        for line in matches:
+            if line.startswith(" ") == False and line.endswith(":"):
+                name = line.strip().split(":")[0]
+            elif line.startswith("  Candidate:"):
+                value = line.strip().replace("Candidate: ", "")
+                entry = {}
+                entry["candidateVersion"] = value
+                results[name] = entry
+                name = None
+        return results
+
+    def info(self, candidates):
+        env = AptEnv.make(self._bootstrap.config())
+        cmd = [ "apt-cache", "show" ]
+        for p in candidates:
+            cmd.append(candidates[p].filterOption(p))
+        proc = subprocess.Popen(cmd, env=env, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+        out, err = proc.communicate()
+        matches = out.decode("utf-8").splitlines()
+
+        r = re.compile('^([a-zA-Z0-9.+-]+)(?:\s+\(([a-zA-Z0-9.+:~-]+)\))?$')
+
+        architecture = None
+        essential = None
+        packageName = None
+        packageVersion = None
+        priority = None
+        sourceName = None
+        sourceVersion = None
+        results = {}
+        for line in matches:
+            if line.startswith("Architecture: "):
+                architecture = line[13:].strip()
+            elif line.startswith("Essential: "):
+                essential = line[10:].strip()
+            elif line.startswith("Package: "):
+                packageName = line[8:].strip()
+            elif line.startswith("Priority: "):
+                priority = line[9:].strip()
+            elif line.startswith("Source: "):
+                source = line[7:].strip()
+                m = r.match(source)
+                if m is not None:
+                    sourceName = m.group(1)
+                    sourceVersion = m.group(2)
+            elif line.startswith("Version: "):
+                packageVersion = line[8:].strip()
+            elif line.strip() == "":
+                if sourceName is None:
+                    sourceName = packageName
+                if sourceVersion is None:
+                    sourceVersion = packageVersion
+
+                entry = {
+                    "architecture": architecture,
+                    "essential": essential,
+                    "packageName": packageName,
+                    "packageVersion": packageVersion,
+                    "priority": priority,
+                    "sourceName": sourceName,
+                    "sourceVersion": sourceVersion
+                }
+
+                if packageName in results:
+                    entries = results[packageName]
+                else:
+                    entries = {}
+                key = ( packageVersion, architecture )
+                entries[key] = entry
+                results[packageName] = entries
+
+                architecture = None
+                essential = None
+                packageName = None
+                packageVersion = None
+                priority = None
+                sourceName = None
+                sourceVersion = None
+        return results
+
+class AptEnv:
+    def make(aptConfigFile):
+        env = os.environ.copy()
+        env["APT_CONFIG"] = aptConfigFile
+        env["DEBIAN_FRONTEND"] = "noninteractive"
+        env["DEBCONF_NONINTERACTIVE_SEEN"] = "true"
+        env["LANG"] = "C"
+        env["LANGUAGE"] = "C"
+        env["LC_ALL"] = "C"
+        env["PATH"] = "/sbin:/usr/sbin:" + env["PATH"]
+        return env
+
+class AptGet:
+    def __init__(self, bootstrap):
+        self._bootstrap = bootstrap
+
+    def download(self, directory, packages):
+        env = AptEnv.make(self._bootstrap.config())
+        cmd = ["apt-get", "download"]
+        for p in packages:
+            version = packages[p]._packageVersion
+            cmd.append(version.filterOption(p))
+ 
+        proc = subprocess.Popen(cmd, cwd=directory, env=env)
+        proc.communicate()
+
+    def resolve(self, packages):
+        env = AptEnv.make(self._bootstrap.config())
+        cmd = ["apt-get", "install", "-s", "-y"]
+        for p in packages:
+            cmd.append(packages[p].filterOption(p))
+        proc = subprocess.Popen(cmd, env=env, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+        out, err = proc.communicate()
+        matches = out.decode("utf-8").splitlines()
+
+        # match install operations reported by "apt-get install"
+        r = re.compile('Inst (\S*) \((\S*)(.*)\[(\S*)\]\)')
+        results = {}
+
+        for line in matches:
+            m = r.match(line)
+            if m is None:
+                continue
+            name = m.group(1)
+            version = m.group(2)
+            architecture = m.group(4)
+            results[name] = AptVersion(version, architecture)
+        return results
+
+class AptVersion:
+    def __init__(self, version, architecture=None):
+        self._version = version
+        self._architecture = architecture
+
+    def hash(self):
+        if self._version is not None and self._architecture is not None:
+            what = ( self._version, self._architecture )
+        elif self._version is not None:
+            what = self._version
+        elif self._architecture is not None:
+            what = self._architecture
+        else:
+            what = None
+        return hash(what)
+
+    def equals(self, other):
+        return self.hash() == other.hash()
+
+    def filterOption(self, name):
+        result = ""
+        if name is not None:
+            result = result + name
+        if self._architecture is not None:
+            result = result + ":%s" % self._architecture
+        if self._version is not None:
+            result = result + "=%s" % self._version
+        return result
+
+    def tuple(self):
+        return ( self._version, self._architecture )
+
+    def unspecified(self):
+        return self._version is None and self._architecture is None
+
+class LockedPackage:
+    def __init__(self, name, version, info, required):
+        self._packageName = name
+        self._packageVersion = version
+        self._sourceName = info["sourceName"]
+        self._sourceVersion = info["sourceVersion"]
+        self._required = required
+
+    def data(self):
+        return {
+            "package": {
+                "version": self._packageVersion._version,
+                "architecture": self._packageVersion._architecture,
+                "required": self._required
+            },
+            "source": {
+                "name": self._sourceName,
+                "version": self._sourceVersion
+            }
+        }
+
+    def file(self):
+        # characters to be escaped in order to generate valid file names
+        ESC_MAP = {
+            ":": "%3a"
+        }
+
+        architecture = self._packageVersion._architecture
+        version = self._packageVersion._version
+
+        # escape the version string
+        for e in ESC_MAP:
+            version = version.replace(e, ESC_MAP[e])
+
+        return "%s_%s_%s.deb" % (self._packageName, version, architecture)
+
+    def required(self):
+        return self._required
+
+    def instantiate(packageName, data):
+        package = data["package"]
+        source  = data["source"]
+        packageVersion = AptVersion(
+            package["version"],
+            package["architecture"]
+        )
+        required = package["required"]
+        info = {}
+        info["sourceName"] = source["name"]
+        info["sourceVersion"] = source["version"]
+        return LockedPackage(packageName, packageVersion, info, required)
+
+if __name__ == '__main__':
+    repositories = [
+        { "type": "deb", "url": "http://ftp.debian.org/debian", "suite": "buster", "components": [ "main", "contrib", "non-free" ]}
+    ]
+    packages = {
+        "bash": "latest",
+        "nano": "latest"
+    }
+
+    bootstrap = AptBootstrap("apt-test")
+    locked_packages = bootstrap.lookup(packages, repositories, architecture="arm64")
+    results = {}
+    for p in locked_packages.values():
+        results[p._packageName] = p.data()
+    results = yaml.dump(results)
+
+    # load image-locked.yaml
+    results = yaml.load(results)
+    locked_packages = {}
+    for packageName in results:
+        p = LockedPackage.instantiate(packageName, results[packageName])
+        locked_packages[packageName] = p
+
+    bootstrap = AptBootstrap("rootfs")
+    bootstrap.download(locked_packages, repositories, architecture="arm64")
