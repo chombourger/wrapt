@@ -75,7 +75,8 @@ class AptBootstrap:
         scr.write("export DEBCONF_NONINTERACTIVE_SEEN=true\n");
         scr.write("export LANG=C\n");
         scr.write("export LANGUAGE=C\n");
-        scr.write("export LC_ALL=C\n\n");
+        scr.write("export LC_ALL=C\n");
+        scr.write("export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n\n");
         scr.write("deb_dir='/stage2/debs'\n")
         scr.write("dpkg_opts='--unpack --force-confnew --force-overwrite --force-depends'\n")
         scr.write("dpkg ${dpkg_opts} -R /stage2/debs\n\n")
