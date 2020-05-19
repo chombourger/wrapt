@@ -69,6 +69,7 @@ class AptBootstrap:
         # Create setup script for our stage 2
         setup_script = os.path.join(self._stage2_dir, "setup.sh")
         scr = open(setup_script, "w")
+        os.chmod(setup_script, 0o755)
         scr.write("#!/bin/sh\n\n");
         scr.write("set -e\n\n");
         scr.write("export DEBIAN_FRONTEND=noninteractive\n");
