@@ -83,13 +83,14 @@ class AptBootstrap:
         # Environment for apt/dpkg tools
         env = AptEnv.make(self.config())
 
-        # Extract downloaded packages (leaving them unconfigured for now)
+        # Extract required packages (others will be unpackaged/installed in the second stage)
         save_env = os.path.join(self._stage2_dir, "fakeroot.env")
         save_env_f = open(save_env, "w")
         for p in lockedPackages.values():
             deb = os.path.join(debs, p.file())
-            #scr.write("dpkg ${dpkg_opts} ${deb_dir}/%s\n" % p.file())
             save_file = tempfile.NamedTemporaryFile(mode="w", delete=False)
+            if p.required() == False:
+                continue
             cmd = [ "fakeroot", "-s", save_file.name, "--", "dpkg", "-X", deb, self._directory ]
             subprocess.check_call(cmd)
             with open(save_file.name, "r") as f:
@@ -155,6 +156,9 @@ class AptBootstrap:
                     sys.stderr.write("adding important package '%s'\n" % p)
                     wanted[p] = AptVersion(version=None)
 
+        # Get list of packages declared required/essential by the distribution
+        minbase = apt.resolve(wanted)
+
         # Add packages listed in the user-provided list to the "wanted" list
         for p in packages:
             if packages[p] == "latest":
@@ -165,8 +169,9 @@ class AptBootstrap:
         versions = apt.resolve(wanted)
         results = {}
         for p in versions:
+            # Remember what packages are required
             required = False
-            if p not in packages and p in wanted:
+            if p in minbase:
                 required = True
             version = versions[p]
             info = all_info[p][version.tuple()]
